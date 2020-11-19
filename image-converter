@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# image-converter: command-line optical disc image converter
+# Copyright (C) 2020 Rok Mandeljc
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+import argparse
+import getpass
+import sys
+
+import gi
+
+gi.require_version("Mirage", "3.2")
+from gi.repository import Mirage  # noqa: E402
+from gi.repository import GLib  # noqa: E402
+
+app_name = "image-converter"
+app_version = "1.0"
+
+
+########################################################################
+#                               Main                                   #
+########################################################################
+class ListWritersAction(argparse.Action):
+    def __init__(
+        self,
+        writers_info,
+        option_strings,
+        dest=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+        help="list available writers and exit",
+    ):
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            default=default,
+            nargs=0,
+            help=help,
+        )
+        self._writers_info = writers_info
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print("Supported writers:")
+        for entry in self._writers_info:
+            print(f" * {entry.id} - {entry.name}")
+        sys.exit(0)
+
+
+# String to boolean conversion helper
+def str2bool(value):
+    return value.lower() in ("yes", "true", "t", "1")
+
+
+def init_writer_subparser(subparsers, info):
+    # Add a parser
+    parser = subparsers.add_parser(
+        name=info.id,
+        description=info.name,
+        help=info.name,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        argument_default=argparse.SUPPRESS,
+    )
+
+    # Retrieve writer's parameter sheet
+    writer = Mirage.create_writer(info.id)
+
+    parameter_ids = writer.lookup_parameter_ids()
+    for parameter_id in parameter_ids:
+        if not parameter_id.startswith("writer."):
+            continue
+
+        # Query info
+        parameter_info = writer.lookup_parameter_info(parameter_id)
+
+        # Create command-line argument
+        dest = parameter_id
+        name = "--" + parameter_id[7:].replace("_", "-")
+        help_str = str(parameter_info.description)
+        default_value = parameter_info.default_value.unpack()
+
+        if parameter_info.enum_values is not None:
+            # Enum
+            choices = parameter_info.enum_values
+            parser.add_argument(
+                name,
+                dest=dest,
+                type=str,
+                default=default_value,
+                choices=choices,
+                help=help_str,
+            )
+        else:
+            param_type = parameter_info.default_value.get_type_string()
+            if param_type == "b":
+                # Boolean
+                parser.add_argument(
+                    name,
+                    dest=dest,
+                    type=str2bool,
+                    default=default_value,
+                    metavar="bool",
+                    help=help_str,
+                )
+            elif param_type == "i":
+                # Integer
+                parser.add_argument(
+                    name,
+                    dest=dest,
+                    type=int,
+                    default=default_value,
+                    metavar="int",
+                    help=help_str,
+                )
+            elif param_type == "s":
+                # String
+                parser.add_argument(
+                    name,
+                    dest=dest,
+                    type=str,
+                    default=default_value,
+                    metavar="str",
+                    help=help_str,
+                )
+
+    del writer
+
+
+def get_password():
+    print("The image you are trying to load is encrypted.", file=sys.stderr)
+    if sys.stdin.isatty():
+        return getpass.getpass("Password: ")
+    else:
+        print("No TTY to ask for password!", file=sys.stderr)
+
+    return None
+
+
+def display_conversion_progress(writer, progress):
+    print("Image conversion in progress: {0:.2f} %".format(progress), end="\r")
+
+
+def main():
+    Mirage.initialize()
+
+    context = Mirage.Context()
+    context.set_password_function(get_password)
+    context.set_debug_domain("image-converter")
+
+    # Obtain list of supported writers
+    ret, writers_info = Mirage.get_writers_info()
+
+    # Command-line parser
+    parser = argparse.ArgumentParser(
+        description="Optical disc image converter.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        argument_default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="%s %s - (C) 2020 Rok Mandeljc" % (app_name, app_version),
+    )
+    parser.add_argument(
+        "--list-writers", action=ListWritersAction, writers_info=writers_info
+    )
+    parser.add_argument("input_image", type=str, nargs="+", help="input image file(s)")
+    writer_subparsers = parser.add_subparsers(
+        title="output image writer",
+        dest="writer_id",
+        metavar="writer_id",
+        required=True,
+        help="writer",
+    )
+    parser.add_argument(
+        "output_image", type=str, nargs=1, help="output image filename or basename"
+    )
+
+    for entry in writers_info:
+        init_writer_subparser(writer_subparsers, entry)
+
+    args = parser.parse_args()
+
+    input_filenames = args.input_image
+    output_filename = args.output_image[0]
+
+    # Load input image
+    print(
+        "Loading image from input file(s): {0}".format(input_filenames), file=sys.stderr
+    )
+    disc = context.load_image(input_filenames)
+
+    # Gather writer arguments - we need to pack them back into GLib
+    # variants...
+    writer_id = args.writer_id
+    writer_parameters = {}
+    for key, value in vars(args).items():
+        if not key.startswith("writer."):
+            continue
+
+        if isinstance(value, str):
+            writer_parameters[key] = GLib.Variant("s", value)
+        elif isinstance(value, bool):
+            writer_parameters[key] = GLib.Variant("b", value)
+        elif isinstance(value, int):
+            writer_parameters[key] = GLib.Variant("i", value)
+
+    # Create writer
+    print("Creating writer of type {0}...".format(writer_id), file=sys.stderr)
+    writer = Mirage.create_writer(writer_id)
+    writer.set_context(context)
+
+    # Set up writer's progress reporting
+    writer.set_conversion_progress_step(5)
+    writer.connect("conversion-progress", display_conversion_progress)
+
+    # Convert
+    print("Converting image...")
+    writer.convert_image(output_filename, disc, writer_parameters, None)
+    print("\nImage conversion complete!")
+
+    # Cleanup
+    del disc
+    del writer
+
+    Mirage.shutdown()
+
+
+if __name__ == "__main__":
+    main()
